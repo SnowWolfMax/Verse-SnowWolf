@@ -144,11 +144,16 @@ async function loadAccounts() {
       renderAccountCarousel(trackEl, accounts, selectedAccount, settings);
     }
 
+    // 基岩版：主页账号区显示「请在游戏内登录」，不要被 Java 账户信息覆盖
+    const homeBar = document.getElementById('home-account-bar');
+    const bedrockMode = !!(homeBar && homeBar.dataset.bedrock === '1');
+
     if (selectedAccount) {
+      const accUuid = (selectedAccount.uuid || '').replace(/-/g, '');
+      if (!bedrockMode) {
       const homeAvatarBox = document.getElementById('home-avatar-box');
       if (homeAvatarBox) homeAvatarBox.classList.remove('home-avatar-add');
-      const accUuid = (selectedAccount.uuid || '').replace(/-/g, '');
-      
+
       document.getElementById('home-player-name').textContent = selectedAccount.username;
       const accountTypeText = selectedAccount.type === 'microsoft' ? '微软账户' : selectedAccount.type === 'thirdparty' ? '外置登录' : '离线模式';
       document.getElementById('home-account-type').textContent = accountTypeText;
@@ -163,6 +168,7 @@ async function loadAccounts() {
         selectedAccount.type,
         AVATAR_CACHE_VERSION
       );
+      }
 
       document.getElementById('launch-player-name').textContent = selectedAccount.username;
       // 使用统一函数加载启动页头像
@@ -176,6 +182,7 @@ async function loadAccounts() {
       );
     } else {
       // 无账户：显示"添加账号"虚线方框 + 十字（点击可进入账户页添加）
+      if (!bedrockMode) {
       const homeAvatar = document.getElementById('home-avatar');
       if (homeAvatar) {
         homeAvatar.innerHTML =
@@ -190,6 +197,7 @@ async function loadAccounts() {
       }
       document.getElementById('home-player-name').textContent = '未登录';
       document.getElementById('home-account-type').textContent = '离线模式';
+      }
       const launchAvatar = document.getElementById('launch-avatar');
       launchAvatar.innerHTML = '<img src="img/icon.png" alt="" class="account-avatar-img">';
       document.getElementById('launch-player-name').textContent = 'Player';
@@ -576,11 +584,14 @@ async function initSkinViewer(skinUrl, resolvedModel) {
     const ch = container.clientHeight || 420;
     // 拿不到皮肤时用本地内置皮肤兜底，保证模型一定显示（离线账户无皮肤等）
     const finalSkinUrl = skinUrl || (skinModel === 'slim' ? 'img/skin_alex.png' : 'img/steve_skin.png');
+    // 模型交给 skinview3d 按皮肤纹理自动识别（与 PCL 的皮肤预览一致）：
+    // 外置登录/第三方皮肤的 account.skinModel 经常缺失或标成 default，
+    // 直接传 'default' 会把 Alex 细手臂皮肤渲染成 Steve 粗手臂。
     S._skinViewer = new skinview3d.SkinViewer({
       width: cw,
       height: ch,
       skin: finalSkinUrl,
-      model: skinModel
+      model: 'auto-detect'
     });
     container.appendChild(S._skinViewer.canvas);
     S._skinViewer.fov = 30;

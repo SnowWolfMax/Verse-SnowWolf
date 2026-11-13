@@ -1,6 +1,6 @@
 [package]
 name = "verse-tauri"
-version = "1.8.5"
+version = "1.8.10"
 description = "VersePC - Minecraft ???"
 license = "GPL-3.0"
 edition = "2024"
@@ -18,6 +18,12 @@ crate-type = ["rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# 生产构建必须启用（tauri build 会自动带上）。
+# 未启用时 tauri 视为 dev 模式，exe 会去连 tauri.conf.json 里的 devUrl
+# （默认 http://localhost:1420），双击运行时页面加载失败，表现为「拒绝访问」。
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = ["devtools"] }
 tokio = { version = "1", features = ["time", "fs", "io-util", "sync", "rt-multi-thread", "macros", "process", "net"] }
@@ -27,6 +33,7 @@ tauri-plugin-dialog = "2"
 dirs = "5"
 md5 = "0.7"
 base64 = "0.22"
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "blocking", "gzip", "deflate"] }
 sha1 = "0.10"
 futures-util = "0.3"

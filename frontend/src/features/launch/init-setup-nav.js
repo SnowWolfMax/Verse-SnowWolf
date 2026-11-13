@@ -4,8 +4,8 @@ import { closeSidebarPanel as closeSidebarPanel } from '../settings/window-theme
 import { handleLaunch as handleLaunch } from './launch.js';
 import { CustomSelect as CustomSelect } from '../misc/custom-select.js';
 import { showToast as showToast } from '../misc/ui-components.js';
-import { loadResourcePage as loadResourcePage } from '../mods/resource.js';
-import { loadVersions as loadVersions, renderHomeCurrentVersionCard as renderHomeCurrentVersionCard, renderVersions as renderVersions, navigateToPage as navigateToPage, loadModLoaderVersions as loadModLoaderVersions } from '../versions/versions.js';
+import { loadVersions as loadVersions, renderHomeCurrentVersionCard as renderHomeCurrentVersionCard, renderVersions as renderVersions } from '../versions/versions-list.js';
+import { navigateToPage as navigateToPage } from '../../core/navigation.js';
 import { appState as appState } from '../../core/app-state.js';
 import { resetBedrockCache } from '../versions/versions-bedrock.js';
 
@@ -73,7 +73,9 @@ function setupTabs() {
         appState.currentVersionTab = tab;
         renderVersions();
       } else if (tab === 'browse-modpacks') {
-        loadResourcePage('modpack');
+        import('../mods/resource.js')
+          .then((m) => m.loadResourcePage('modpack'))
+          .catch((e) => console.error('[setup] 资源页模块加载失败:', e));
       }
     });
   });
@@ -83,7 +85,9 @@ function setupTabs() {
       document.querySelectorAll('.loader-type-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       appState.currentLoaderType = btn.dataset.loader;
-      loadModLoaderVersions();
+      import('../versions/versions-loaders.js')
+        .then((m) => m.loadModLoaderVersions())
+        .catch((e) => console.error('[setup] 加载器模块加载失败:', e));
     });
   });
 }

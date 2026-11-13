@@ -77,12 +77,6 @@ pub async fn api_proxy(
         .await;
     }
 
-    // 基岩版路由（清单 / 123 云盘登录态 / 下载安装）
-    if path.starts_with("/api/bedrock")
-        && let Some(r) = crate::bedrock::handle(&app, &method, &path, &params, &body).await {
-            return r;
-        }
-
     // 下载/安装相关路由（async，优先处理）
     if (path.starts_with("/api/install")
         || path == "/api/check-version-name"
@@ -195,6 +189,12 @@ pub async fn api_proxy(
         || path.starts_with("/api/neoforge")
         || path.starts_with("/api/optifine"))
         && let Some(r) = modloaders::handle(&method, &path, &params, &body).await {
+            return r;
+        }
+
+    // 基岩版路由（清单 / mcappx 下载页 / 本地包导入 / 系统包识别）
+    if path.starts_with("/api/bedrock")
+        && let Some(r) = crate::bedrock::handle(&app, &method, &path, &params, &body).await {
             return r;
         }
 

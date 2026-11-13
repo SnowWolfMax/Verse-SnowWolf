@@ -110,9 +110,17 @@ const API_BASE = '';
 /* Tauri 环境检测 — 在 Tauri 下 API 走 invoke('api_proxy') 而非 fetch */
 const _isTauri = !!(window.__TAURI__ || window.__TAURI_INTERNALS__ || (bridge && bridge.apiProxy));
 
-async function _tauriApiProxy(method, path, params, body) {
-    // 30 秒超时，防止 Rust 端卡住时 init 流程永远阻塞
-    const _timeoutMs = 30000;
+async function _tauriApiProxy(method, path, params, body, timeoutMs) {
+    // 默认 30 秒超时，防止 Rust 端卡住时 init 流程永远阻塞。
+    // 启动依赖检查、第三方认证服务器响应可能较慢，单独放宽，
+    // 避免误报"请求失败"或"请求超时"。
+    const _longRunningPaths = [
+        '/api/launch/check',
+        '/api/launch/download-deps',
+        '/api/accounts/thirdparty-login',
+        '/api/accounts/thirdparty-select-profile'
+    ];
+    const _timeoutMs = timeoutMs || (_longRunningPaths.includes(path) ? 180000 : 30000);
     let _timer = null;
     const _timeoutP = new Promise((_, reject) => {
         _timer = setTimeout(() => reject(new Error('API 超时: ' + path)), _timeoutMs);
@@ -191,7 +199,7 @@ async function apiGet(path, params = {}, timeout = 30000) {
     // Tauri 环境：走 invoke('api_proxy')
     if (_isTauri && _isApiPath(path)) {
         try {
-            const res = await _tauriApiProxy('GET', path, params, null);
+            const res = await _tauriApiProxy('GET', path, params, null, timeout);
             if (!res.ok) {
                 const body = await res.json();
                 const errMsg = body && body.error ? body.error : `HTTP ${res.status}`;
@@ -202,7 +210,8 @@ async function apiGet(path, params = {}, timeout = 30000) {
         } catch (e) {
             if (e instanceof ApiError) throw e;
             console.error(`API GET ${path} failed:`, e);
-            throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+            // 保留底层错误信息（如 "API 超时: /api/..."），不要统一吞成"请求失败"
+            throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
         }
     }
     // Electron/浏览器环境：走 fetch
@@ -220,7 +229,7 @@ async function apiGet(path, params = {}, timeout = 30000) {
     } catch (e) {
         if (e instanceof ApiError) throw e;
         console.error(`API GET ${path} failed:`, e);
-        throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+        throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
     }
 }
 
@@ -235,7 +244,7 @@ async function apiPost(path, data = {}, timeout = 30000) {
     // Tauri 环境：走 invoke('api_proxy')
     if (_isTauri && _isApiPath(path)) {
         try {
-            const res = await _tauriApiProxy('POST', path, {}, data);
+            const res = await _tauriApiProxy('POST', path, {}, data, timeout);
             if (!res.ok) {
                 const body = await res.json();
                 const errMsg = body && body.error ? body.error : `HTTP ${res.status}`;
@@ -246,7 +255,7 @@ async function apiPost(path, data = {}, timeout = 30000) {
         } catch (e) {
             if (e instanceof ApiError) throw e;
             console.error(`API POST ${path} failed:`, e);
-            throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+            throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
         }
     }
     // Electron/浏览器环境：走 fetch
@@ -266,7 +275,7 @@ async function apiPost(path, data = {}, timeout = 30000) {
     } catch (e) {
         if (e instanceof ApiError) throw e;
         console.error(`API POST ${path} failed:`, e);
-        throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+        throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
     }
 }
 
@@ -291,7 +300,7 @@ async function apiDelete(path, data = {}) {
         } catch (e) {
             if (e instanceof ApiError) throw e;
             console.error(`API DELETE ${path} failed:`, e);
-            throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+            throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
         }
     }
     // Electron/浏览器环境：走 fetch
@@ -311,7 +320,7 @@ async function apiDelete(path, data = {}) {
     } catch (e) {
         if (e instanceof ApiError) throw e;
         console.error(`API DELETE ${path} failed:`, e);
-        throw new ApiError('请求失败', 'UNKNOWN_ERROR', e);
+        throw new ApiError((e && e.message) || '请求失败', 'UNKNOWN_ERROR', e);
     }
 }
 
@@ -325,7 +334,8 @@ const API = {
     memoryOptimize: () => bridge?.memoryOptimize?.() || Promise.reject(new Error('记忆优化能力不可用')),
 
     // === 游戏版本管理 ===
-    getVersions: (refresh = false) => apiGet('/api/versions', { refresh: refresh ? 'true' : '' }),
+    getVersions: (refresh = false, installedOnly = false) =>
+        apiGet('/api/versions', { refresh: refresh ? 'true' : '', installed: installedOnly ? 'true' : '' }),
     deleteVersion: (versionId, permanent) => apiPost('/api/version/delete', { versionId, permanent: !!permanent }),
     getDeleteChain: (versionId) => apiPost('/api/version/delete-chain', { versionId }),
     openVersionFolder: (versionId, folderType) => apiGet('/api/version/open-folder', { versionId, folderType }),
@@ -344,6 +354,9 @@ const API = {
     getBedrockVersions: (refresh = false) =>
         apiGet('/api/bedrock/versions', { refresh: refresh ? 'true' : '' }, 90000),
     bedrockInstall: (version, link) => apiPost('/api/bedrock/install', { version, link }),
+    bedrockOpenShare: (version, link) => apiPost('/api/bedrock/open-share', { version, link }),
+    bedrockInstallLocal: (version, zipPath) => apiPost('/api/bedrock/install-local', { version, zipPath }),
+    bedrockAdoptInstalled: () => apiPost('/api/bedrock/adopt-installed', {}),
     bedrockInstallProgress: (sessionId) => apiGet('/api/bedrock/install-progress', { sessionId }),
     bedrockInstallCancel: (sessionId) => apiPost('/api/bedrock/install-cancel', { sessionId }),
     bedrockLoginStatus: () => apiGet('/api/bedrock/login-status'),
@@ -496,8 +509,8 @@ const API = {
     getInstalledJava: () => apiGet('/api/java/installed'),
     getJavaInstallStatus: (sessionId) =>
         apiGet('/api/java/install-status', { sessionId }),
-    autoInstallJava: (requiredVersion = 17) =>
-        apiPost('/api/java/auto-install', { requiredVersion }),
+    autoInstallJava: (requiredVersion = 17, maxVersion = 999) =>
+        apiPost('/api/java/auto-install', { requiredVersion, maxVersion }),
     getJavaDownloadSources: () => apiGet('/api/java/download-sources'),
     downloadJava: (majorVersion) => apiPost('/api/java/download', { majorVersion }),
     cancelJavaDownload: (sessionId) => apiPost('/api/java/cancel', { sessionId }),

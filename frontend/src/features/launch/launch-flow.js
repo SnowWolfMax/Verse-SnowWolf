@@ -25,7 +25,7 @@ async function handleLaunch() {
   appState._cachedLastLaunchVersion = versionId;
   try { await bridge.store.set('versepc_last_launch_version', versionId); } catch (_) {}
 
-  // 基岩版：不走账户/Java/文件校验，直接启动本地 exe
+  // 基岩版：不走账户/Java/文件校验，由后端按安装标记拉起
   const _bedrockVersion = (appState.installedVersions || []).find(v => v.id === versionId && v.isBedrock);
   if (_bedrockVersion) {
     try {
@@ -87,14 +87,16 @@ async function handleLaunch() {
       // ===== 自动补 Java（对齐 Electron 版 autoInstallJava）=====
       setLaunchStep('java-check', 'running', `未找到 Java ${rangeDesc}，正在自动下载...`);
       try {
-        const ai = await API.autoInstallJava(requiredVer);
+        // 必须把版本上限一起传给后端：仅按“不低于 required”判断会把 Java 25
+        // 误判为可用（Forge 1.16.5 等旧版本只允许 Java 8），从而跳过 Java 8 下载。
+        const ai = await API.autoInstallJava(requiredVer, maxVer);
         if (ai && ai.success && ai.javaPath) {
           setLaunchStep('java-check', 'success', `Java ${ai.version || requiredVer} 已就绪 ✓`);
         } else if (ai && ai.success && ai.sessionId) {
           const ok = await waitJavaAutoInstall(ai.sessionId, requiredVer, rangeDesc);
           if (!ok) {
             setLaunchStep('java-check', 'error', `Java ${rangeDesc} 自动下载失败`);
-            showLaunchError(`Java 自动下载失败，请检查网络后重试，或前往 Java 管理页面手动安装。<br><a href="javascript:void(0)" id="launch-nav-java" style="color:var(--accent);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
+            showLaunchError(`Java 自动下载失败，请检查网络后重试，或前往 Java 管理页面手动安装。<br><a href="javascript:void(0)" id="launch-nav-java" style="color: var(--accent-ink);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
             launchBtn.disabled = false;
             homeLaunchBtn.disabled = false;
             S.launching = false;
@@ -106,7 +108,7 @@ async function handleLaunch() {
         }
       } catch (e) {
         setLaunchStep('java-check', 'error', `Java ${rangeDesc} 自动下载失败`);
-        showLaunchError(`${e.message || 'Java 自动下载失败'}<br><a href="javascript:void(0)" id="launch-nav-java" style="color:var(--accent);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
+        showLaunchError(`${e.message || 'Java 自动下载失败'}<br><a href="javascript:void(0)" id="launch-nav-java" style="color: var(--accent-ink);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
         launchBtn.disabled = false;
         homeLaunchBtn.disabled = false;
         S.launching = false;
@@ -119,7 +121,7 @@ async function handleLaunch() {
       } catch (_) {}
       if (!depCheck.java || !depCheck.java.ok) {
         setLaunchStep('java-check', 'error', `Java ${rangeDesc} 仍未就绪`);
-        showLaunchError(`${serverMsg || `未找到合适的Java运行环境（需要 Java ${rangeDesc}）`}<br><a href="javascript:void(0)" id="launch-nav-java" style="color:var(--accent);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
+        showLaunchError(`${serverMsg || `未找到合适的Java运行环境（需要 Java ${rangeDesc}）`}<br><a href="javascript:void(0)" id="launch-nav-java" style="color: var(--accent-ink);text-decoration:underline;cursor:pointer;">前往 Java 管理页面 →</a>`);
         launchBtn.disabled = false;
         homeLaunchBtn.disabled = false;
         S.launching = false;

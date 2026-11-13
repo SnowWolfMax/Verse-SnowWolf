@@ -517,8 +517,7 @@ pub(crate) fn mark_installed(remote_versions: &mut [Value], local_ids: &[String]
 pub(crate) fn is_april_fools_id(id: &str) -> bool {
     matches!(
         id,
-        "26.1.1"
-            | "26w14a"
+        "26w14a"
             | "25w14craftmine"
             | "24w14potato"
             | "23w13a_or_b"
@@ -538,5 +537,85 @@ pub(crate) fn mark_april_fools(remote_versions: &mut [Value]) {
             && let Some(obj) = v.as_object_mut() {
                 obj.insert("type".to_string(), json!("special"));
             }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_base_version_from_loader_ids() {
+        assert_eq!(extract_base_version("1.20.1-forge-47.2.0"), "1.20.1");
+        assert_eq!(extract_base_version("1.21.1-neoforge-21.1.0"), "1.21.1");
+        assert_eq!(extract_base_version("custom-pack"), "");
+    }
+
+    #[test]
+    fn april_fools_ids_are_recognized() {
+        assert!(is_april_fools_id("24w14potato"));
+        assert!(is_april_fools_id("26w14a"));
+        assert!(!is_april_fools_id("1.20.1"));
+        assert!(!is_april_fools_id(""));
+        // 26.1.1 是正式补丁版本，不能因为发布日期在 4 月 1 日就归入愚人节分类
+        assert!(!is_april_fools_id("26.1.1"));
+    }
+
+    #[test]
+    fn mark_installed_sets_flags() {
+        let mut versions = vec![
+            json!({"id": "1.20.1"}),
+            json!({"id": "1.21.1"}),
+        ];
+        mark_installed(&mut versions, &["1.20.1".to_string()]);
+        assert_eq!(versions[0]["installed"], true);
+        assert_eq!(versions[0]["size"], "");
+        assert_eq!(versions[1]["installed"], false);
+    }
+
+    #[test]
+    fn mark_april_fools_sets_special_type() {
+        let mut versions = vec![
+            json!({"id": "24w14potato", "type": "snapshot"}),
+            json!({"id": "1.20.1", "type": "release"}),
+        ];
+        mark_april_fools(&mut versions);
+        assert_eq!(versions[0]["type"], "special");
+        assert_eq!(versions[1]["type"], "release");
+    }
+
+    #[test]
+    fn count_mods_jar_ignores_disabled_and_non_jar() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.jar"), b"x").unwrap();
+        std::fs::write(dir.path().join("b.JAR"), b"x").unwrap();
+        std::fs::write(dir.path().join("c.jar.disabled"), b"x").unwrap();
+        std::fs::write(dir.path().join("d.txt"), b"x").unwrap();
+        assert_eq!(count_mods_jar(dir.path()), 2);
+        assert_eq!(count_mods_jar(dir.path().join("missing").as_path()), 0);
+    }
+
+    #[test]
+    fn modpack_inherits_loader_from_parent_object() {
+        let mut versions = vec![
+            json!({"id": "1.20.1-forge-47.2.0", "isForge": true, "baseVersion": "1.20.1"}),
+            json!({"id": "pack", "isModpack": true, "inheritsFrom": "1.20.1-forge-47.2.0"}),
+        ];
+        inherit_loader_from_parent(&mut versions);
+        assert_eq!(versions[1]["isForge"], true);
+        assert_eq!(versions[1]["baseVersion"], "1.20.1");
+    }
+
+    #[test]
+    fn modpack_inherits_loader_from_parent_id_when_missing() {
+        let mut versions = vec![
+            json!({"id": "pack", "isModpack": true, "inheritsFrom": "fabric-loader-0.15.0-1.20.1"}),
+            json!({"id": "neo", "isModpack": true, "inheritsFrom": "1.21-neoforge-21.1.0"}),
+        ];
+        inherit_loader_from_parent(&mut versions);
+        assert_eq!(versions[0]["isFabric"], true);
+        assert_eq!(versions[1]["isNeoForge"], true);
+        assert!(versions[1].get("isForge").is_none());
     }
 }
