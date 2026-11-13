@@ -43,7 +43,9 @@ process.env.CARGO_TARGET_DIR = cargoTargetDir;
 
 // 3. 编译 Tauri（只生成 exe，不打包安装包）
 //    tauri.conf.json 的 beforeBuildCommand 会自动执行 vite build
-run('npx tauri build');
+// 必须显式启用 custom-protocol：否则产物是 dev 模式，内嵌 devUrl 而不是前端资源，
+// 双击运行时页面连不上 http://localhost:1420，表现就是「拒绝访问」。
+run('npx tauri build --features custom-protocol');
 
 // 4. 定位编译产物 exe（CARGO_TARGET_DIR 生效时在 E 盘，否则回退到项目 target）
 const exeSrc = firstExisting([

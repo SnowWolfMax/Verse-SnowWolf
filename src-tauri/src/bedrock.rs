@@ -40,9 +40,32 @@ fn read_token() -> String {
         .unwrap_or_default()
 }
 
-fn save_token(token: &str) {
+fn save_token(token: &str) -> bool {
     let _ = std::fs::create_dir_all(data_dir());
-    let _ = std::fs::write(token_path(), token.trim());
+    match std::fs::write(token_path(), token.trim()) {
+        Ok(_) => {
+            login_log(&format!("token saved len={}", token.len()));
+            true
+        }
+        Err(e) => {
+            login_log(&format!("token save failed: {e}"));
+            false
+        }
+    }
+}
+
+/// 登录流程诊断日志：写入 data/logs/bedrock-login.log
+/// 用于排查「登录窗口一闪就关」「token 没落盘」这类只在用户机器上复现的问题
+fn login_log(msg: &str) {
+    let dir = data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("bedrock-login.log"))
+        .and_then(|mut f| writeln!(f, "[{}] {}", ts, msg));
 }
 
 fn versions_dir() -> PathBuf {
@@ -191,27 +214,158 @@ fn set_login(status: &str, message: &str) {
 }
 
 fn close_login_window(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("bedrock-123-login") {
-        let _ = win.close();
+    // 登录窗口由 tauri.conf.json 预创建，这里只隐藏不销毁，下次复用同一个 WebView
+    // （运行时用 builder 创建窗口在这个构建里拿不到 HWND，只能走配置声明）
+    match app.get_webview_window("bedrock-123-login") {
+        Some(win) => {
+            login_log("hide login window");
+            let _ = win.hide();
+        }
+        None => login_log("hide login window: not found"),
     }
+}
+
+/// 枚举本进程所有顶层窗口（标题/可见性/矩形）写进日志，
+/// 并强制把登录窗口摆到屏幕中央、真正显示出来。
+/// 不依赖 WebviewWindow::hwnd()（该接口在此构建里恒返回不可用）。
+/// 只能在**非主线程**调用。
+#[cfg(target_os = "windows")]
+fn dump_and_force_login_window(width: i32, height: i32) -> String {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(
+            cb: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid_out: *mut u32) -> u32;
+        fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, max: i32) -> i32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            insert_after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+
+    static FOUND: OnceLock<Mutex<Vec<(isize, String, i32)>>> = OnceLock::new();
+
+    unsafe extern "system" fn collect_cb(hwnd: *mut c_void, lparam: isize) -> i32 {
+        let pid = lparam as u32;
+        let mut wpid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut wpid);
+            if wpid == pid {
+                let mut buf = [0u16; 260];
+                let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), 260);
+                let title = if n > 0 {
+                    String::from_utf16_lossy(&buf[..n as usize])
+                } else {
+                    String::new()
+                };
+                let visible = IsWindowVisible(hwnd);
+                if let Some(list) = FOUND.get() {
+                    list.lock().unwrap().push((hwnd as isize, title, visible));
+                }
+            }
+        }
+        1
+    }
+
+    let list = FOUND.get_or_init(|| Mutex::new(Vec::new()));
+    list.lock().unwrap().clear();
+    unsafe {
+        EnumWindows(collect_cb, std::process::id() as isize);
+    }
+    let items: Vec<(isize, String, i32)> = list.lock().unwrap().clone();
+
+    let sw = unsafe { GetSystemMetrics(0) };
+    let sh = unsafe { GetSystemMetrics(1) };
+    let x = ((sw - width) / 2).max(0);
+    let y = ((sh - height) / 2).max(0);
+    let mut out = String::new();
+    for (h, title, visible) in items {
+        let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        unsafe { GetWindowRect(h as *mut c_void, &mut r) };
+        out.push_str(&format!(
+            "[{title:?} vis={visible} {}x{}@({},{})] ",
+            r.right - r.left,
+            r.bottom - r.top,
+            r.left,
+            r.top
+        ));
+        // 登录窗口判定：标题含 123；或标题为空但可见（主窗口标题固定、输入法窗口不可见）
+        let is_login = title.contains("123") || (title.is_empty() && visible == 1);
+        if is_login {
+            unsafe {
+                // HWND_TOPMOST(-1)：不置顶的话，尺寸更大的主窗口会把登录窗口整个盖住
+                SetWindowPos(
+                    h as *mut c_void,
+                    (-1isize) as *mut c_void,
+                    x,
+                    y,
+                    width,
+                    height,
+                    0x0040, // SWP_SHOWWINDOW
+                );
+                ShowWindow(h as *mut c_void, 5);
+                let mut after = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+                GetWindowRect(h as *mut c_void, &mut after);
+                out.push_str(&format!(
+                    "<forced {h} after={}x{}@({},{})>",
+                    after.right - after.left,
+                    after.bottom - after.top,
+                    after.left,
+                    after.top
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dump_and_force_login_window(_width: i32, _height: i32) -> String {
+    String::from("unsupported")
 }
 
 fn handle_login_request(app: AppHandle, request_line: &str) {
     // 形如：GET /collect?t=xxx HTTP/1.1
     let path = request_line.split_whitespace().nth(1).unwrap_or("");
+    login_log(&format!("collect hit, path_len={}", path.len()));
     if let Some(pos) = path.find("t=") {
         let raw = &path[pos + 2..];
         let token = percent_decode(raw.split('&').next().unwrap_or(raw))
             .trim()
             .trim_start_matches("Bearer ")
             .to_string();
+        login_log(&format!("parsed token len={}", token.len()));
         if token.len() > 8 {
             save_token(&token);
             set_login("success", "登录成功");
+            login_log("closing login window after success");
             close_login_window(&app);
             return;
         }
     }
+    login_log("no usable token in request");
     set_login("failed", "没有读到登录态，请重新登录");
 }
 
@@ -269,39 +423,62 @@ fn start_login_browser(app: &AppHandle) -> Result<(), String> {
         }
     });
 
-    let app_build = app.clone();
+    let app_show = app.clone();
     let js_for_window = poll_js.clone();
-    let _ = app.run_on_main_thread(move || {
-        let url = "https://www.123pan.com/".parse().unwrap();
-        let builder = tauri::WebviewWindowBuilder::new(
-            &app_build,
-            "bedrock-123-login",
-            tauri::WebviewUrl::External(url),
-        )
-        .title("登录 123 云盘（登录后会自动关闭）")
-        .inner_size(1080.0, 760.0);
+    login_log(&format!("login port={port}, showing window"));
 
-        match builder.build() {
-            Ok(win) => {
-                let _ = win.eval(&js_for_window);
+    // 登录窗口已在 tauri.conf.json 里预创建（和主窗口走同一条创建路径，HWND 正常）。
+    // 运行时只 show + 注入脚本；这些调用必须放在非主线程，主线程里调会等待自己而死锁。
+    std::thread::spawn(move || match app_show.get_webview_window("bedrock-123-login") {
+        Some(win) => {
+            login_log("worker: found pre-created login window");
+            match win.set_size(tauri::LogicalSize::new(1080.0, 760.0)) {
+                Ok(_) => login_log("worker: set_size ok"),
+                Err(e) => login_log(&format!("worker: set_size err {e}")),
             }
-            Err(e) => set_login("failed", &format!("无法打开登录窗口：{}", e)),
+            match win.center() {
+                Ok(_) => login_log("worker: center ok"),
+                Err(e) => login_log(&format!("worker: center err {e}")),
+            }
+            match win.show() {
+                Ok(_) => login_log("worker: show ok"),
+                Err(e) => login_log(&format!("worker: show err {e}")),
+            }
+            match win.set_focus() {
+                Ok(_) => login_log("worker: focus ok"),
+                Err(e) => login_log(&format!("worker: focus err {e}")),
+            }
+            match win.eval(&js_for_window) {
+                Ok(_) => login_log("worker: eval ok"),
+                Err(e) => login_log(&format!("worker: eval err {e}")),
+            }
+            // 不依赖 hwnd()，直接枚举本进程窗口并强制显示登录窗口
+            let info = dump_and_force_login_window(1080, 760);
+            login_log(&format!("worker: windows {info}"));
+        }
+        None => {
+            login_log("worker: login window missing");
+            set_login("failed", "登录窗口未初始化，请重启程序");
         }
     });
 
     Ok(())
 }
 
-// ==================== MineBBS 清单 ====================
+// ==================== 基岩版清单（mcappx JSON，回退 MineBBS） ====================
+
+/// mcappx 官方维护的版本数据源：一次请求拿全量，比 MineBBS 翻页快得多
+const MCAPPX_JSON: &str = "https://data.mcappx.com/v2/bedrock.json";
 
 fn cache_path() -> PathBuf {
-    data_dir().join("cache").join("bedrock-versions.json")
+    data_dir().join("cache").join("bedrock-versions-mcappx.json")
 }
 
 fn load_cache() -> Option<Vec<Value>> {
     let meta = std::fs::metadata(cache_path()).ok()?;
     let modified = meta.modified().ok()?;
-    if modified.elapsed().ok()?.as_secs() > 6 * 3600 {
+    // 缓存有效期 24 小时：接口每页有 250KB、要翻 6 页，重复拉取代价太高
+    if modified.elapsed().ok()?.as_secs() > 24 * 3600 {
         return None;
     }
     let text = std::fs::read_to_string(cache_path()).ok()?;
@@ -312,49 +489,138 @@ fn load_cache() -> Option<Vec<Value>> {
         .cloned()
 }
 
+/// 拉取一页清单，返回 (该页数据, 总页数)
+fn fetch_page(page: u32) -> Result<(Vec<Value>, u32), String> {
+    let client = http_client(15, false);
+    let url = format!("{}&page={}", MINEBBS_API_BASE, page);
+    let resp = client
+        .get(&url)
+        .header("Referer", "https://mc.minebbs.com/")
+        .send()
+        .map_err(|e| format!("无法连接 MineBBS：{}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("MineBBS 返回 HTTP {}", resp.status()));
+    }
+    let text = resp.text().map_err(|e| format!("读取清单失败：{}", e))?;
+    let root: Value = serde_json::from_str(&text).map_err(|e| format!("清单格式异常：{}", e))?;
+    let list = root
+        .get("data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let total = root
+        .get("totalPages")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as u32;
+    Ok((list, total))
+}
+
 fn fetch_manifest(force: bool) -> Result<Vec<Value>, String> {
     if !force && let Some(list) = load_cache() {
         return Ok(list);
     }
-    let client = http_client(10, false);
-    let mut all: Vec<Value> = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let url = format!("{}&page={}", MINEBBS_API_BASE, page);
-        let resp = client
-            .get(&url)
-            .header("Referer", "https://mc.minebbs.com/")
-            .send()
-            .map_err(|e| format!("无法连接 MineBBS：{}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("MineBBS 返回 HTTP {}", resp.status()));
+
+    // 优先 mcappx：单次请求返回全部版本；不可用时回退到 MineBBS 分页
+    let all = match fetch_mcappx_manifest() {
+        Ok(list) => list,
+        Err(e) => {
+            login_log(&format!("mcappx 清单不可用，回退 MineBBS：{e}"));
+            fetch_minebbs_manifest()?
         }
-        let text = resp.text().map_err(|e| format!("读取清单失败：{}", e))?;
-        let root: Value = serde_json::from_str(&text).map_err(|e| format!("清单格式异常：{}", e))?;
-        let list = root
-            .get("data")
-            .and_then(|d| d.as_array())
+    };
+
+    let _ = std::fs::create_dir_all(cache_path().parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::write(cache_path(), json!({ "data": all.clone() }).to_string());
+    Ok(all)
+}
+
+/// 解析 mcappx 的 JSON：键是版本号，值里有类型/日期/架构变体
+fn fetch_mcappx_manifest() -> Result<Vec<Value>, String> {
+    let client = http_client(20, false);
+    let resp = client
+        .get(MCAPPX_JSON)
+        .send()
+        .map_err(|e| format!("无法连接 mcappx 数据源：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("mcappx 数据源返回 HTTP {}", resp.status()));
+    }
+    let root: Value = resp.json().map_err(|e| format!("mcappx 数据格式异常：{e}"))?;
+    let map = root
+        .get("From_mcappx.com")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "mcappx 数据里没有版本表".to_string())?;
+
+    let mut out = Vec::new();
+    for (version, info) in map {
+        let release_type = utils::get_str(info, "Type");
+        let build_type = utils::get_str(info, "BuildType");
+        let id = utils::get_str(info, "ID");
+        let date = utils::get_str(info, "Date");
+        let variations = info
+            .get("Variations")
+            .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        if list.is_empty() {
-            break;
+        // 只取 x64，且 ArchivalStatus >= 2（1 = 未发布、0 = 已丢失）
+        let x64 = variations.iter().find(|v| {
+            utils::get_str(v, "Arch").eq_ignore_ascii_case("x64")
+                && v.get("ArchivalStatus").and_then(|s| s.as_u64()).unwrap_or(0) >= 2
+        });
+        let Some(var) = x64 else { continue };
+        let os_build = utils::get_str(var, "OSbuild");
+        let md5 = utils::get_str(var, "MD5");
+        let mut abstract_text = format!("{release_type} · {build_type} · x64");
+        if !os_build.is_empty() {
+            abstract_text.push_str(&format!(" · Win{os_build}+"));
         }
-        all.extend(list);
-        let total_pages = root
-            .get("totalPages")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1)
-            .max(1) as u32;
-        if page >= total_pages || page >= 12 {
-            break;
-        }
-        page += 1;
+        out.push(json!({
+            "version": version,
+            "id": id,
+            "time": date,
+            "size": 0,
+            "downloadlinks": [],
+            "abstract": abstract_text,
+            "buildType": build_type,
+            "releaseType": release_type,
+            "md5": md5,
+        }));
     }
+    if out.is_empty() {
+        return Err("mcappx 没有返回可用版本".to_string());
+    }
+    // Date 是 ISO 日期字符串，直接按字符串倒序就是最新在前
+    out.sort_by(|a, b| utils::get_str(b, "time").cmp(&utils::get_str(a, "time")));
+    Ok(out)
+}
+
+fn fetch_minebbs_manifest() -> Result<Vec<Value>, String> {
+    // 先拉第一页，顺便确定总页数
+    let (mut all, total_pages) = fetch_page(1)?;
+    let last = total_pages.min(12);
+    if last > 1 {
+        // 其余页并发拉取：接口 pageSize 最大只能 10，6 页串行在网络差时要几十秒，
+        // 并发后总耗时约等于最慢的一页
+        let pages: Vec<u32> = (2..=last).collect();
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = pages
+                .into_iter()
+                .map(|p| scope.spawn(move || fetch_page(p)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err("清单线程异常".to_string())))
+                .collect::<Vec<_>>()
+        });
+        for r in results {
+            let (list, _) = r?;
+            all.extend(list);
+        }
+    }
+
     if all.is_empty() {
         return Err("MineBBS 没有返回版本数据".to_string());
     }
-    let _ = std::fs::create_dir_all(cache_path().parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(cache_path(), json!({ "data": all.clone() }).to_string());
     Ok(all)
 }
 
@@ -373,7 +639,47 @@ fn installed_versions() -> Vec<String> {
     out
 }
 
+/// 清单版本与已装目录名的对应关系是松散的：
+/// 清单里可能叫 1.21.111，而安装目录是 1.21.11101.0，所以按数字串前缀比较。
+/// 返回实际已装目录名，这样前端点启动时能找到对应的 bedrock.json
+fn match_installed(version: &str, id: &str, installed: &[String]) -> Option<String> {
+    if let Some(hit) = installed.iter().find(|i| i.as_str() == version) {
+        return Some(hit.clone());
+    }
+    let digits = |s: &str| -> String { s.chars().filter(|c| c.is_ascii_digit()).collect() };
+    let want = {
+        let d = digits(id);
+        if d.is_empty() { digits(version) } else { d }
+    };
+    if want.len() < 6 {
+        return None;
+    }
+    installed
+        .iter()
+        .find(|i| {
+            let d = digits(i);
+            d.len() >= 6 && (d.starts_with(&want) || want.starts_with(&d))
+        })
+        .cloned()
+}
+
 // ==================== 123 分享解析 ====================
+
+/// 按 mcappx 的站内路由拼版本详情页：
+///   1.21.111   → /bedrock/1.21/1.21.111/
+///   26.70.24   → /bedrock/26.70/26.70.24/
+///   26.62      → /bedrock/26.60/26.62/
+/// 26.x 起站方按十位建目录（26.62 归到 26.60），1.x 时代是逐个 minor 建目录，不能取整。
+fn mcappx_version_url(version: &str) -> String {
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or("");
+    let minor = parts.next().unwrap_or("");
+    let dir = match minor.parse::<u32>() {
+        Ok(n) if major != "1" && n >= 10 => format!("{}.{}", major, (n / 10) * 10),
+        _ => format!("{}.{}", major, minor),
+    };
+    format!("https://www.mcappx.com/bedrock/{dir}/{version}/")
+}
 
 fn resolve_share_url(link: &str) -> Result<String, String> {
     let url = if link.starts_with("//") { format!("https:{}", link) } else { link.to_string() };
@@ -647,6 +953,26 @@ fn update_session<F: FnOnce(&mut BedrockSession)>(_app: &AppHandle, id: &str, f:
     }
 }
 
+/// 不依赖 AppHandle 的会话状态更新（本地导入任务用）
+fn set_session(id: &str, status: &str, progress: u32, message: &str) {
+    let mut map = sessions();
+    if let Some(s) = map.get_mut(id) {
+        s.status = status.into();
+        s.progress = progress;
+        s.message = message.into();
+    }
+}
+
+fn set_session_error(id: &str, message: &str) {
+    let mut map = sessions();
+    if let Some(s) = map.get_mut(id) {
+        s.status = "failed".into();
+        s.progress = 0;
+        s.message = message.into();
+        s.error = message.into();
+    }
+}
+
 fn api_code(v: &Value) -> i64 {
     v.get("code")
         .and_then(|c| {
@@ -781,7 +1107,7 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<PathBuf, String> {
         .or_else(|| candidates.iter().find(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or("").eq_ignore_ascii_case("bedrock_server.exe")))
         .or_else(|| candidates.first())
         .cloned();
-    pick.ok_or_else(|| "压缩包里没有找到可执行文件".to_string())
+    pick.ok_or_else(|| "压缩包里没有可执行文件（既没有 Minecraft.Windows.exe，也没有 appx/msix 包）".to_string())
 }
 
 fn walk_exe(dir: &Path) -> Vec<PathBuf> {
@@ -953,6 +1279,284 @@ fn install_task(
     });
 }
 
+/// 从本地安装包安装：zip 解压进版本目录；appx/msix 交给系统部署（UWP 包不能解压直接跑）
+fn install_local_task(session_id: &str, version: &str, package_path: &str) -> ApiResult {
+    let pkg = Path::new(package_path);
+    if !pkg.exists() {
+        set_session_error(session_id, "找不到这个文件");
+        return ApiResult::err(400, "找不到这个文件");
+    }
+    let ext = pkg
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" => install_zip_task(session_id, version, pkg),
+        "appx" | "appxbundle" | "msix" | "msixbundle" => {
+            install_appx_task(session_id, version, package_path)
+        }
+        _ => {
+            let msg = "只支持 zip / appx / msix / msixbundle 安装包";
+            set_session_error(session_id, msg);
+            ApiResult::err(400, msg)
+        }
+    }
+}
+
+/// 解压式安装（免安装整合包）
+fn install_zip_task(session_id: &str, version: &str, zip: &Path) -> ApiResult {
+    set_session(session_id, "running", 8, "正在解压安装包");
+    let version_dir = versions_dir().join(storage::sanitize_version_id(version));
+    match extract_zip(zip, &version_dir) {
+        Ok(exe) => {
+            let relative_exe = exe
+                .strip_prefix(&version_dir)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| exe.to_string_lossy().to_string());
+            let manifest = json!({
+                "version": version,
+                "exe": relative_exe,
+                "installedAt": now_ms(),
+                "source": "local-zip",
+            });
+            if let Err(e) = std::fs::write(
+                version_dir.join("bedrock.json"),
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            ) {
+                set_session_error(session_id, &format!("写入安装标记失败：{e}"));
+                return ApiResult::err(500, &format!("写入安装标记失败：{e}"));
+            }
+            login_log(&format!("install-local ok: {version} -> {relative_exe}"));
+            set_session(session_id, "completed", 100, "安装完成");
+            ApiResult::ok(json!({
+                "success": true,
+                "version": version,
+                "exe": relative_exe,
+            }))
+        }
+        Err(e) => {
+            // 有些资源把 .appx/.msix 再套一层 zip 发布：解压后没有 exe，就把包找出来交给系统部署
+            if let Some(pkg) = find_appx_pkg(&version_dir) {
+                let pkg_str = pkg.to_string_lossy().to_string();
+                login_log(&format!("install-local: zip 里是 appx，转系统部署 {pkg_str}"));
+                return install_appx_task(session_id, version, &pkg_str);
+            }
+            login_log(&format!("install-local failed: {e}"));
+            set_session_error(session_id, &e);
+            ApiResult::err(500, &e)
+        }
+    }
+}
+
+/// 在解压出来的目录里找 appx/msix 安装包
+fn find_appx_pkg(dir: &Path) -> Option<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_appx_pkg(&path) {
+                return Some(found);
+            }
+        } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "appx" | "appxbundle" | "msix" | "msixbundle"
+            )
+        }) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 通过 Add-AppxPackage 把 appx/msix 注册进系统。
+/// UWP 应用必须先完成包注册才能运行，官方包解压出来直接跑是没有意义的。
+fn install_appx_task(session_id: &str, version: &str, package_path: &str) -> ApiResult {
+    login_log(&format!("install-appx start: {version} <- {package_path}"));
+    set_session(session_id, "running", 20, "正在部署到系统（大包要几分钟，别关启动器）");
+
+    // PowerShell 单引号字符串里，单引号要写成两个
+    let quoted = package_path.replace('\'', "''");
+    let script = format!(
+        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;\
+$ErrorActionPreference='Stop';\
+try {{ Add-AppxPackage -Path '{quoted}' -ErrorAction Stop }} \
+catch {{ Write-Output ('ERR:' + $_.Exception.Message); exit 1 }};\
+Get-AppxPackage -Name Microsoft.MinecraftUWP | Select-Object -First 1 -Property PackageFamilyName,InstallLocation | ConvertTo-Json -Compress"
+    );
+
+    let (ok, raw) = match run_powershell(&script) {
+        Ok(v) => v,
+        Err(e) => {
+            login_log(&format!("install-appx spawn failed: {e}"));
+            set_session_error(session_id, &e);
+            return ApiResult::err(500, &e);
+        }
+    };
+
+    if !ok {
+        // 部署失败但系统里本来就有基岩版（比如同版本重复导入），按已安装登记，至少能启动
+        if let Some(pfn) = query_installed_pfn() {
+            login_log(&format!("install-appx failed but package present: {pfn} | {raw}"));
+            return finish_appx(session_id, version, &pfn, None, "系统里已有基岩版，已登记为已安装");
+        }
+        let hint = appx_error_hint(&raw);
+        login_log(&format!("install-appx failed: {raw}"));
+        set_session_error(session_id, &hint);
+        return ApiResult::err(500, &hint);
+    }
+
+    let info: Value = serde_json::from_str(raw.trim()).unwrap_or(Value::Null);
+    let pfn = utils::get_str(&info, "PackageFamilyName");
+    let location = utils::get_str(&info, "InstallLocation");
+    if pfn.is_empty() {
+        let msg = "包装上去了，但没找到 Minecraft 的包标识，无法启动；请确认这是基岩版的安装包";
+        login_log("install-appx: deployed but PackageFamilyName missing");
+        set_session_error(session_id, msg);
+        return ApiResult::err(500, msg);
+    }
+
+    let loc = if location.is_empty() { None } else { Some(location.as_str()) };
+    finish_appx(session_id, version, &pfn, loc, "安装完成")
+}
+
+/// 写入 appx 的安装标记（bedrock.json），让列表和主页能识别
+fn finish_appx(
+    session_id: &str,
+    version: &str,
+    pfn: &str,
+    location: Option<&str>,
+    message: &str,
+) -> ApiResult {
+    let aumid = format!("{pfn}!App");
+    let version_dir = versions_dir().join(storage::sanitize_version_id(version));
+    let _ = std::fs::create_dir_all(&version_dir);
+    let manifest = json!({
+        "version": version,
+        "type": "appx",
+        "aumid": aumid,
+        "packageFamily": pfn,
+        "installLocation": location.unwrap_or(""),
+        "installedAt": now_ms(),
+        "source": "local-appx",
+    });
+    if let Err(e) = std::fs::write(
+        version_dir.join("bedrock.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    ) {
+        let msg = format!("写入安装标记失败：{e}");
+        set_session_error(session_id, &msg);
+        return ApiResult::err(500, &msg);
+    }
+    login_log(&format!("install-appx ok: {version} -> {aumid}"));
+    set_session(session_id, "completed", 100, message);
+    ApiResult::ok(json!({
+        "success": true,
+        "version": version,
+        "type": "appx",
+        "aumid": aumid,
+    }))
+}
+
+/// 跑一次 PowerShell，返回 (是否成功, 输出文本)
+fn run_powershell(script: &str) -> Result<(bool, String), String> {
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script);
+    let output = cmd.output().map_err(|e| format!("调用系统部署工具失败：{e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let ok = output.status.success() && !stdout.contains("ERR:");
+    let raw = if stdout.contains("ERR:") || ok {
+        stdout
+    } else {
+        stderr
+    };
+    Ok((ok, raw))
+}
+
+/// 查系统里已注册的基岩版包标识
+fn query_installed_pfn() -> Option<String> {
+    let script = "Get-AppxPackage -Name Microsoft.MinecraftUWP | Select-Object -First 1 -ExpandProperty PackageFamilyName";
+    let (ok, raw) = run_powershell(script).ok()?;
+    if !ok {
+        return None;
+    }
+    let pfn = raw.trim().to_string();
+    if pfn.is_empty() {
+        None
+    } else {
+        Some(pfn)
+    }
+}
+
+/// 查系统里已注册的基岩版：返回 (包族名, 版本, 安装路径)
+fn query_installed_package() -> Option<(String, String, String)> {
+    let script = "Get-AppxPackage -Name Microsoft.MinecraftUWP | Select-Object -First 1 -Property PackageFamilyName,Version,InstallLocation | ConvertTo-Json -Compress";
+    let (ok, raw) = run_powershell(script).ok()?;
+    if !ok {
+        return None;
+    }
+    let info: Value = serde_json::from_str(raw.trim()).ok()?;
+    let pfn = info.get("PackageFamilyName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if pfn.is_empty() {
+        return None;
+    }
+    let ver = info
+        .get("Version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let loc = info
+        .get("InstallLocation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((pfn, ver, loc))
+}
+
+/// 把 Add-AppxPackage 的失败信息翻成用户能看懂的话
+fn appx_error_hint(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let hints: [(&str, &str); 7] = [
+        (
+            "0x80073cff",
+            "系统没开旁加载：设置 → 系统 → 开发者选项 → 打开「开发人员模式」",
+        ),
+        (
+            "0x80073cf3",
+            "缺少依赖包（一般是 VCLibs 或 UI.Xaml），先装依赖再重新导入",
+        ),
+        (
+            "0x800b0109",
+            "安装包签名不受信任：把包里的 .cer 证书导入「受信任的根证书颁发机构」后重试",
+        ),
+        ("0x800b010a", "证书链不完整，同上处理"),
+        (
+            "0x80073cf9",
+            "系统策略禁止安装非商店应用，可能被组策略或安全软件拦截",
+        ),
+        (
+            "0x80073d28",
+            "系统里已经装了更高版本，先在「设置 → 应用」里卸载旧版",
+        ),
+        ("0x80070005", "权限不足，请以管理员身份运行启动器"),
+    ];
+    for (code, hint) in hints {
+        if lower.contains(code) {
+            return format!("{hint}（{raw}）");
+        }
+    }
+    format!("导入失败：{raw}")
+}
+
 fn fail(app: &AppHandle, session_id: &str, msg: &str) {
     update_session(app, session_id, |s| {
         s.status = "failed".into();
@@ -966,7 +1570,23 @@ fn fail(app: &AppHandle, session_id: &str, msg: &str) {
 pub fn launch(version_id: &str) -> Result<String, String> {
     let marker = marker_path(version_id);
     let text = std::fs::read_to_string(&marker).map_err(|e| format!("读取基岩版安装信息失败：{}", e))?;
-    let info: Value = serde_json::from_str(&text).map_err(|e| format!("基岩版安装信息损坏：{}", e))?;
+    // 有些工具（比如 PowerShell 的 Set-Content）会写进 BOM，serde 会直接报 column 1
+    let text = text.trim_start_matches('\u{feff}');
+    let info: Value = serde_json::from_str(text).map_err(|e| format!("基岩版安装信息损坏：{}", e))?;
+
+    // appx 导入的版本已经在系统里注册，按 AUMID 拉起，不走 exe 路径
+    if utils::get_str(&info, "type") == "appx" {
+        let aumid = utils::get_str(&info, "aumid");
+        if aumid.is_empty() {
+            return Err("安装信息里没有应用标识，请重新导入安装包".to_string());
+        }
+        std::process::Command::new("explorer.exe")
+            .arg(format!("shell:appsFolder\\{aumid}"))
+            .spawn()
+            .map_err(|e| format!("启动基岩版失败：{}", e))?;
+        return Ok("基岩版已启动".to_string());
+    }
+
     let exe_rel = utils::get_str(&info, "exe");
     if exe_rel.is_empty() {
         return Err("安装信息里没有启动程序".to_string());
@@ -1004,18 +1624,29 @@ pub async fn handle(
             let result = tokio::task::spawn_blocking(move || fetch_manifest(force)).await;
             match result {
                 Ok(Ok(list)) => {
+                    login_log(&format!("versions: ok, {} items", list.len()));
                     let versions: Vec<Value> = list
                         .into_iter()
                         .map(|v| {
                             let version = utils::get_str(&v, "version");
+                            let id = utils::get_str(&v, "id");
                             let links = v.get("downloadlinks").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-                            let time = v.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let installed_flag = installed.iter().any(|i| i == &version);
+                            // mcappx 给的是 ISO 日期字符串，MineBBS 给的是秒级时间戳
+                            let time = match v.get("time") {
+                                Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                                Some(Value::Number(n)) => utils::ts_to_iso(n.as_u64().unwrap_or(0)),
+                                _ => String::new(),
+                            };
+                            let matched = match_installed(&version, &id, &installed);
+                            let installed_flag = matched.is_some();
+                            // 已装时用真实目录名做 id，启动时才能找到 bedrock.json
+                            let display_version = matched.clone().unwrap_or_else(|| version.clone());
                             json!({
-                                "id": v.get("id").cloned().unwrap_or(Value::Null),
-                                "version": version,
+                                "id": id,
+                                "version": display_version,
+                                "manifestVersion": version,
                                 "size": v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
-                                "time": utils::ts_to_iso(time.max(0) as u64),
+                                "time": time,
                                 "abstract": utils::get_str(&v, "abstract"),
                                 "wiki": utils::get_str(&v, "wikiLinks"),
                                 "links": links,
@@ -1026,10 +1657,94 @@ pub async fn handle(
                         .collect();
                     Some(ApiResult::ok(json!({ "versions": versions })))
                 }
-                Ok(Err(e)) => Some(ApiResult::err(502, &e)),
-                Err(_) => Some(ApiResult::err(500, "清单任务异常")),
+                Ok(Err(e)) => {
+                    login_log(&format!("versions: fetch failed: {e}"));
+                    Some(ApiResult::err(502, &e))
+                }
+                Err(e) => {
+                    login_log(&format!("versions: join error: {e}"));
+                    Some(ApiResult::err(500, "清单任务异常"))
+                }
             }
         }
+
+        // 在系统浏览器打开下载页：mcappx 源没有 123 短链，直接打开版本库官网
+        "POST /api/bedrock/open-share" => {
+            let data = body.as_ref().or(params.as_ref()).cloned().unwrap_or(Value::Null);
+            let link = utils::get_str(&data, "link");
+            let version = utils::get_str(&data, "version");
+            if link.is_empty() {
+                // mcappx 清单没有 123 短链，直接打开该版本的详情页
+                let url = mcappx_version_url(&version);
+                if let Err(e) = open::that(&url) {
+                    return Some(ApiResult::err(500, &format!("无法打开浏览器：{e}")));
+                }
+                login_log(&format!("open-share: {version} -> {url} (mcappx)"));
+                return Some(ApiResult::ok(json!({
+                    "success": true,
+                    "url": url,
+                    "version": version,
+                    "site": "mcappx",
+                })));
+            }
+            match resolve_share_url(&link) {
+                Ok(url) => {
+                    if let Err(e) = open::that(&url) {
+                        return Some(ApiResult::err(500, &format!("无法打开浏览器：{e}")));
+                    }
+                    login_log(&format!("open-share: {version} -> {url}"));
+                    Some(ApiResult::ok(json!({
+                        "success": true,
+                        "url": url,
+                        "version": version,
+                    })))
+                }
+                Err(e) => Some(ApiResult::err(502, &e)),
+            }
+        }
+
+        // 从本地安装包导入：浏览器下载完的包，由用户在这里选中导入
+        // 部署 appx 可能要好几分钟，所以做成异步会话，前端轮询进度而不是干等 HTTP
+        "POST /api/bedrock/install-local" => {
+            let data = body.as_ref().or(params.as_ref()).cloned().unwrap_or(Value::Null);
+            let version = utils::get_str(&data, "version");
+            let package_path = utils::get_str(&data, "zipPath");
+            if version.is_empty() || package_path.is_empty() {
+                return Some(ApiResult::err(400, "缺少版本号或文件路径"));
+            }
+            let session_id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut map = sessions();
+                map.insert(
+                    session_id.clone(),
+                    BedrockSession {
+                        status: "running".into(),
+                        progress: 0,
+                        message: "准备导入安装包".into(),
+                        version: version.clone(),
+                        ..Default::default()
+                    },
+                );
+            }
+            let sid = session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = install_local_task(&sid, &version, &package_path);
+            });
+            Some(ApiResult::ok(json!({ "success": true, "sessionId": session_id })))
+        }
+
+        // 系统里已经装好基岩版（商店装过、或者被别的方式侧载过），直接认领进版本列表
+        "POST /api/bedrock/adopt-installed" => match query_installed_package() {
+            Some((pfn, ver, loc)) => {
+                let version = if ver.is_empty() { "system".to_string() } else { ver };
+                let loc_ref = if loc.is_empty() { None } else { Some(loc.as_str()) };
+                Some(finish_appx("-", &version, &pfn, loc_ref, "已登记系统里的基岩版"))
+            }
+            None => Some(ApiResult::err(
+                404,
+                "系统里没找到基岩版，请先用「从本地包导入」安装",
+            )),
+        },
 
         "POST /api/bedrock/install" => {
             let data = body.as_ref().or(params.as_ref()).cloned().unwrap_or(Value::Null);

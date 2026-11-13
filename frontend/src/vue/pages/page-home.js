@@ -13,9 +13,11 @@
 import { gameStore } from '../../core/game-store.js';
 
 import { loadAccounts } from '../../features/accounts/accounts-list.js';
+import { appState } from '../../core/app-state.js';
 import { updateGameStatus, stopGameInstance } from '../../features/launch/launch.js';
 import { loadVersions } from '../../features/versions/versions-list.js';
 import { navigateToPage } from '../../core/navigation.js';
+import { showToast } from '../../features/misc/ui-components.js';
 
 const LAYOUT_KEY = 'versepc_home_layout_v1';
 const AVATAR_MIN = 0.5, AVATAR_MAX = 2.0, DRAG_THRESHOLD = 5;
@@ -118,6 +120,35 @@ const PageHome = {
     }
   },
   methods: {
+    // 基岩版：账号在游戏内（Xbox）登录，启动器侧账号栏改成提示
+    applyBedrockAccountUI(isBedrock) {
+      const prev = this._bedrockApplied;
+      this._bedrockApplied = isBedrock;
+      const bar = document.getElementById('home-account-bar');
+      if (bar) bar.dataset.bedrock = isBedrock ? '1' : '0';
+      if (!isBedrock) {
+        // 只有从基岩版切回 Java 版才需要重画；首次加载由 loadAccounts 自己处理
+        if (prev === true) loadAccounts().catch(function () {});
+        return;
+      }
+      const nameEl = document.getElementById('home-player-name');
+      const typeEl = document.getElementById('home-account-type');
+      const avatar = document.getElementById('home-avatar');
+      const box = document.getElementById('home-avatar-box');
+      if (nameEl) nameEl.textContent = '请在游戏内登录';
+      if (typeEl) typeEl.textContent = '基岩版';
+      if (box) box.classList.remove('home-avatar-add');
+      if (avatar) {
+        avatar.innerHTML = '<img src="img/icons/bedrock.webp" alt="" class="home-avatar-img" style="image-rendering:auto;border-radius:12px">';
+      }
+    },
+    // 轮询检测当前启动版本是否基岩版（appState 是普通对象，Vue 观测不到）
+    syncBedrockAccount() {
+      const vid = (typeof appState !== 'undefined' && appState.currentLaunchVersionId) || '';
+      const list = (typeof appState !== 'undefined' && appState.installedVersions) || [];
+      const v = vid ? list.find(x => x.id === vid) : null;
+      this.applyBedrockAccountUI(!!(v && v.isBedrock));
+    },
     widgetByKey(key) {
       return {
         title: this.$refs.titleEl,
@@ -304,6 +335,11 @@ const PageHome = {
       });
       // 头像：编辑模式下拖动 + 滚轮缩放，默认点击进账户
       this.bindDrag(this.$refs.avatarEl, 'avatar', function () {
+        // 基岩版账号在游戏内（Xbox）登录，账户页对它没有意义
+        if (self._bedrockApplied) {
+          if (typeof showToast === 'function') showToast('基岩版请在游戏内登录（Xbox 账号）', 'info');
+          return;
+        }
         if (typeof navigateToPage === 'function') navigateToPage('accounts');
       });
       const avatarEl = this.$refs.avatarEl;
@@ -396,6 +432,10 @@ const PageHome = {
       clearInterval(this._runningTimer);
       this._runningTimer = null;
     }
+    if (this._bedrockTimer) {
+      clearInterval(this._bedrockTimer);
+      this._bedrockTimer = null;
+    }
   },
   mounted() {
     const self = this;
@@ -405,7 +445,10 @@ const PageHome = {
         return;
       }
       // 刷新账户显示（含头像加载）和版本列表（含主页版本卡片渲染）
-      loadAccounts().catch(function (e) { console.error('[PageHome] loadAccounts error:', e); });
+      // 账户刷新是异步的，等它画完再按当前版本决定是否需要切成基岩版文案
+      loadAccounts()
+        .then(function () { self.syncBedrockAccount(); })
+        .catch(function (e) { console.error('[PageHome] loadAccounts error:', e); });
       loadVersions().catch(function (e) { console.error('[PageHome] loadVersions error:', e); });
       // 拉取一次运行中游戏状态，让主页启动任务卡片尽快显示
       if (typeof updateGameStatus === 'function') {
@@ -417,6 +460,9 @@ const PageHome = {
       // 运行卡片由 v-if 延迟挂载，轮询检测其出现并应用布局
       self.syncRunningCard();
       self._runningTimer = setInterval(function () { self.syncRunningCard(); }, 1200);
+      // 版本切换后同步账号栏（基岩版显示「请在游戏内登录」）
+      self.syncBedrockAccount();
+      self._bedrockTimer = setInterval(function () { self.syncBedrockAccount(); }, 1200);
     };
     requestAnimationFrame(function () { setTimeout(init, 50); });
   }
